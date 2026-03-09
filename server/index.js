@@ -10,7 +10,6 @@ app.use(cors());
 
 // 🔥 React Build ausliefern
 app.use(express.static(path.join(__dirname, "../client/dist")));
-
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "../client/dist/index.html"));
 });
@@ -18,64 +17,156 @@ app.get("*", (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-io.on("connection", socket => {
+io.on("connection", (socket) => {
 
-  socket.on("createRoom", (roomId, cb) => {
-    roomManager.createRoom(roomId);
-    roomManager.joinRoom(roomId, socket.id);
+  /* ========================
+     ROOM MANAGEMENT
+  ======================== */
+
+  socket.on("createRoom", ({ roomId, name }, cb) => {
+    if (!roomId) return cb && cb({ ok: false, error: "no roomId" });
+
+    if (!roomManager.getRoom(roomId)) {
+      roomManager.createRoom(roomId);
+    }
+
+    roomManager.joinRoom(roomId, socket.id, name || "Spieler");
     socket.join(roomId);
-    cb(true);
+
+    const room = roomManager.getRoom(roomId);
+    io.to(roomId).emit("roomUpdate", {
+      players: room.players.length,
+      names: room.names
+    });
+
+    cb && cb({ ok: true });
   });
 
-  socket.on("joinRoom", (roomId, cb) => {
-    if (!roomManager.joinRoom(roomId, socket.id)) return cb(false);
+  socket.on("joinRoom", ({ roomId, name }, cb) => {
+    const room = roomManager.getRoom(roomId);
+    if (!room) return cb && cb({ ok: false, error: "Room not found" });
+
+    roomManager.joinRoom(roomId, socket.id, name || "Spieler");
     socket.join(roomId);
-    cb(true);
+
+    io.to(roomId).emit("roomUpdate", {
+      players: room.players.length,
+      names: room.names
+    });
+
+    cb && cb({ ok: true });
   });
+
+  socket.on("disconnect", () => {
+    for (const roomId of Object.keys(roomManager.rooms)) {
+      const room = roomManager.rooms[roomId];
+      if (room.players.includes(socket.id)) {
+        roomManager.leaveRoom(roomId, socket.id);
+
+        io.to(roomId).emit("roomUpdate", {
+          players: roomManager.rooms[roomId]?.players.length || 0,
+          names: roomManager.rooms[roomId]?.names || {}
+        });
+      }
+    }
+  });
+
+  /* ========================
+     GAME START
+  ======================== */
 
   socket.on("startGame", (roomId, cb) => {
+    const room = roomManager.getRoom(roomId);
+    if (!room) return cb && cb({ ok: false, error: "Room not found" });
+
     const game = roomManager.startGame(roomId);
+
+    broadcastState(roomId);
+
     io.to(roomId).emit("gameStarted", {
-      players: game.players,
+      players: room.players,
+      names: room.names
     });
-    cb(true);
+
+    cb && cb({ ok: true });
   });
+
+  /* ========================
+     GAME ACTIONS
+  ======================== */
 
   socket.on("draw", (roomId, cb) => {
     const room = roomManager.getRoom(roomId);
     const game = room?.game;
-    if (!game) return;
-    if (game.getCurrentPlayer() !== socket.id) return;
+    if (!game) return cb && cb(null);
+
+    if (game.getCurrentPlayer() !== socket.id) return cb && cb(null);
 
     const card = game.drawCard();
-    cb(card);
+    cb && cb(card);
   });
 
-  socket.on("replace", ({ roomId, index, value }) => {
-    const game = roomManager.getRoom(roomId)?.game;
-    if (!game) return;
+  socket.on("replace", ({ roomId, index, value }, cb) => {
+    const room = roomManager.getRoom(roomId);
+    const game = room?.game;
+    if (!game) return cb && cb({ ok: false });
 
-    game.replaceCard(socket.id, index, value);
-    game.checkMatches(socket.id);
-    game.nextTurn();
-    io.to(roomId).emit("stateUpdate", game);
+    if (game.getCurrentPlayer() !== socket.id) {
+      return cb && cb({ ok: false, error: "Not your turn" });
+    }
+
+    if (index === -1) {
+      game.discard.push(value);
+      game.nextTurn();
+    } else {
+      game.replaceCard(socket.id, index, value);
+    }
+
+    broadcastState(roomId);
+    cb && cb({ ok: true });
   });
 
-  socket.on("callCabo", (roomId) => {
-    const game = roomManager.getRoom(roomId)?.game;
-    if (!game) return;
+  socket.on("callCabo", (roomId, cb) => {
+    const room = roomManager.getRoom(roomId);
+    const game = room?.game;
+    if (!game) return cb && cb({ ok: false });
 
     game.callCabo(socket.id);
-    io.to(roomId).emit("caboCalled", socket.id);
+    broadcastState(roomId);
+    cb && cb({ ok: true });
   });
 
-  socket.on("score", (roomId) => {
-    const game = roomManager.getRoom(roomId)?.game;
-    if (!game) return;
+  socket.on("score", (roomId, cb) => {
+    const room = roomManager.getRoom(roomId);
+    const game = room?.game;
+    if (!game) return cb && cb({ ok: false });
 
-    const result = game.scoreRound();
+    const result = game.score();
     io.to(roomId).emit("roundResult", result);
+    cb && cb({ ok: true });
   });
+
+  /* ========================
+     HELPER
+  ======================== */
+
+  function broadcastState(roomId) {
+    const room = roomManager.getRoom(roomId);
+    if (!room || !room.game) return;
+
+    const game = room.game;
+
+    // Public state
+    io.to(roomId).emit("stateUpdate", {
+      ...game.getPublicState(),
+      names: room.names
+    });
+
+    // Private hands
+    room.players.forEach((playerId) => {
+      io.to(playerId).emit("yourHand", game.getPrivateHand(playerId));
+    });
+  }
 
 });
 
